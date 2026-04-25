@@ -11,6 +11,25 @@ import { getDb, schema } from '../lib/db.js';
 import { requireAuth } from '../lib/auth-hook.js';
 import { marketDataSnapshot } from '../services/market-data.js';
 
+/**
+ * Gate for bootstrap/debug endpoints. Uses the same token mechanism as
+ * the existing /admin/bootstrap-* routes. Returns true iff the header
+ * matches the env var; writes the 403 reply on failure.
+ */
+function requireBootstrap(req: FastifyRequest, reply: FastifyReply): boolean {
+  const token = (req.headers['x-admin-bootstrap-token'] as string | undefined) ?? '';
+  const expected = process.env.ADMIN_BOOTSTRAP_TOKEN;
+  if (!expected || expected.length < 16) {
+    reply.code(503).send({ error: 'bootstrap_not_configured' });
+    return false;
+  }
+  if (token !== expected) {
+    reply.code(403).send({ error: 'forbidden' });
+    return false;
+  }
+  return true;
+}
+
 async function requireAdmin(req: FastifyRequest, reply: FastifyReply): Promise<void> {
   await requireAuth(req, reply);
   if (reply.sent) return;
@@ -407,5 +426,331 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       delta,
       laterRowsBumped: Math.max(0, later.length - 1),
     };
+  });
+
+  /* ============================================================
+   * Bootstrap-gated debug endpoints for the autonomous engine.
+   * All gated by X-Admin-Bootstrap-Token header.
+   * ============================================================ */
+
+  /**
+   * GET /admin/debug/status — comprehensive read-only snapshot of the trading
+   * engine. Returns market data, flags, strategies, strategy_funds for every
+   * user, pending+recent intents, recent trades. Safe to poll from ops.
+   */
+  app.get('/admin/debug/status', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const db = getDb();
+    const since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const [flags, strategies, funds, pendingIntents, recentIntents, recentTrades] =
+      await Promise.all([
+        db.select().from(schema.systemFlags),
+        db.select().from(schema.strategies),
+        db
+          .select({
+            userId: schema.strategyFunds.userId,
+            strategyId: schema.strategyFunds.strategyId,
+            slug: schema.strategies.slug,
+            usdcBalance: schema.strategyFunds.usdcBalance,
+            ethBalance: schema.strategyFunds.ethBalance,
+            ethAvgEntryUsd: schema.strategyFunds.ethAvgEntryUsd,
+            realizedPnlUsd: schema.strategyFunds.realizedPnlUsd,
+            lastTradeAt: schema.strategyFunds.lastTradeAt,
+            updatedAt: schema.strategyFunds.updatedAt,
+          })
+          .from(schema.strategyFunds)
+          .leftJoin(schema.strategies, eq(schema.strategyFunds.strategyId, schema.strategies.id)),
+        db
+          .select()
+          .from(schema.tradeIntents)
+          .where(eq(schema.tradeIntents.status, 'pending'))
+          .orderBy(desc(schema.tradeIntents.createdAt))
+          .limit(20),
+        db
+          .select()
+          .from(schema.tradeIntents)
+          .where(gte(schema.tradeIntents.createdAt, since))
+          .orderBy(desc(schema.tradeIntents.createdAt))
+          .limit(50),
+        db
+          .select({
+            id: schema.trades.id,
+            userId: schema.trades.userId,
+            strategyId: schema.trades.strategyId,
+            side: schema.trades.side,
+            tokenIn: schema.trades.tokenIn,
+            tokenOut: schema.trades.tokenOut,
+            amountIn: schema.trades.amountIn,
+            amountOut: schema.trades.amountOut,
+            notionalUsd: schema.trades.notionalUsd,
+            gasUsd: schema.trades.gasUsd,
+            slippage: schema.trades.slippage,
+            txHash: schema.trades.txHash,
+            status: schema.trades.status,
+            realizedPnlUsd: schema.trades.realizedPnlUsd,
+            createdAt: schema.trades.createdAt,
+          })
+          .from(schema.trades)
+          .orderBy(desc(schema.trades.createdAt))
+          .limit(20),
+      ]);
+
+    // Map strategy IDs to slugs for easier reading
+    const slugById = new Map(strategies.map((s) => [s.id, s.slug]));
+
+    const tradingEnabled =
+      (process.env.TRADING_ENABLED ?? 'true').toLowerCase() !== 'false' &&
+      !(flags.find((f) => f.key === 'circuit_breaker_enabled')?.boolValue ?? false);
+
+    return {
+      trading_enabled: tradingEnabled,
+      trading_enabled_env: process.env.TRADING_ENABLED ?? 'true',
+      circuit_breaker: flags.find((f) => f.key === 'circuit_breaker_enabled')?.boolValue ?? false,
+      market: marketDataSnapshot(),
+      flags: flags.map((f) => ({ key: f.key, bool: f.boolValue, string: f.stringValue })),
+      strategies: strategies.map((s) => ({
+        id: s.id,
+        slug: s.slug,
+        name: s.name,
+        status: s.status,
+      })),
+      funds: funds.map((f) => ({
+        userId: f.userId,
+        strategyId: f.strategyId,
+        strategySlug: f.slug,
+        usdc: Number(f.usdcBalance) / 1e6,
+        eth: Number(f.ethBalance) / 1e18,
+        ethAvgEntryUsd: Number(f.ethAvgEntryUsd),
+        realizedPnlUsd: Number(f.realizedPnlUsd),
+        lastTradeAt: f.lastTradeAt,
+        updatedAt: f.updatedAt,
+      })),
+      pendingIntents: pendingIntents.map((i) => ({
+        id: i.id,
+        userId: i.userId,
+        strategySlug: slugById.get(i.strategyId) ?? null,
+        side: i.side,
+        tokenIn: i.tokenIn,
+        tokenOut: i.tokenOut,
+        amountIn: i.amountIn,
+        reason: i.reason,
+        createdAt: i.createdAt,
+      })),
+      recentIntents: recentIntents.map((i) => ({
+        id: i.id,
+        userId: i.userId,
+        strategySlug: slugById.get(i.strategyId) ?? null,
+        side: i.side,
+        tokenIn: i.tokenIn,
+        tokenOut: i.tokenOut,
+        amountIn: i.amountIn,
+        reason: i.reason,
+        status: i.status,
+        errorMessage: i.errorMessage,
+        createdAt: i.createdAt,
+        updatedAt: i.updatedAt,
+      })),
+      recentTrades: recentTrades.map((t) => ({
+        ...t,
+        strategySlug: slugById.get(t.strategyId) ?? null,
+        notionalUsd: Number(t.notionalUsd),
+        gasUsd: Number(t.gasUsd),
+        slippage: Number(t.slippage),
+        realizedPnlUsd: Number(t.realizedPnlUsd),
+        createdAt: t.createdAt,
+      })),
+    };
+  });
+
+  /**
+   * POST /admin/debug/kill — flip the global circuit breaker.
+   * Body: { enabled: boolean }.
+   * Same effect as /admin/circuit-breaker but bootstrap-gated (no JWT needed).
+   */
+  app.post('/admin/debug/kill', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const body = (req.body ?? {}) as { enabled?: boolean };
+    if (typeof body.enabled !== 'boolean') {
+      return reply.code(400).send({ error: 'enabled_boolean_required' });
+    }
+    const db = getDb();
+    await db
+      .insert(schema.systemFlags)
+      .values({ key: 'circuit_breaker_enabled', boolValue: body.enabled })
+      .onConflictDoUpdate({
+        target: schema.systemFlags.key,
+        set: { boolValue: body.enabled, updatedAt: new Date() },
+      });
+    return { ok: true, circuit_breaker_enabled: body.enabled };
+  });
+
+  /**
+   * POST /admin/debug/seed-funds — create/update a strategy_funds row.
+   * Used to bootstrap the initial allocation for a user's deposit.
+   * Body: { userId, strategySlug, usdcBase (string), ethWei (string), ethAvgEntryUsd? (number) }
+   * `usdcBase` is USDC base units (6 decimals), `ethWei` is ETH wei (18 decimals).
+   * If a row already exists, it's overwritten. Existing realizedPnlUsd is preserved.
+   */
+  const SeedInput = z.object({
+    userId: z.string().uuid(),
+    strategySlug: z.string().min(1),
+    usdcBase: z.string().regex(/^\d+$/),
+    ethWei: z.string().regex(/^\d+$/),
+    ethAvgEntryUsd: z.number().optional(),
+  });
+  app.post('/admin/debug/seed-funds', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const parsed = SeedInput.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_input', details: parsed.error.flatten() });
+    }
+    const db = getDb();
+    const [strat] = await db
+      .select()
+      .from(schema.strategies)
+      .where(eq(schema.strategies.slug, parsed.data.strategySlug))
+      .limit(1);
+    if (!strat) return reply.code(404).send({ error: 'strategy_not_found' });
+
+    const [existing] = await db
+      .select()
+      .from(schema.strategyFunds)
+      .where(
+        and(
+          eq(schema.strategyFunds.userId, parsed.data.userId),
+          eq(schema.strategyFunds.strategyId, strat.id),
+        ),
+      )
+      .limit(1);
+
+    const avgEntry =
+      parsed.data.ethAvgEntryUsd != null ? parsed.data.ethAvgEntryUsd.toFixed(6) : '0';
+
+    if (existing) {
+      const [updated] = await db
+        .update(schema.strategyFunds)
+        .set({
+          usdcBalance: parsed.data.usdcBase,
+          ethBalance: parsed.data.ethWei,
+          ethAvgEntryUsd: avgEntry,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.strategyFunds.id, existing.id))
+        .returning();
+      return { ok: true, action: 'updated', row: updated };
+    } else {
+      const [inserted] = await db
+        .insert(schema.strategyFunds)
+        .values({
+          userId: parsed.data.userId,
+          strategyId: strat.id,
+          usdcBalance: parsed.data.usdcBase,
+          ethBalance: parsed.data.ethWei,
+          ethAvgEntryUsd: avgEntry,
+          realizedPnlUsd: '0',
+        })
+        .returning();
+      return { ok: true, action: 'inserted', row: inserted };
+    }
+  });
+
+  /**
+   * POST /admin/debug/force-intent — inject a trade intent directly.
+   * Used for smoke-testing executor without waiting for strategy runner.
+   * Body: { userId, strategySlug, side, tokenIn, tokenOut, amountIn (string base units), reason? }
+   */
+  const ForceIntent = z.object({
+    userId: z.string().uuid(),
+    strategySlug: z.string().min(1),
+    side: z.enum(['buy', 'sell']),
+    tokenIn: z.enum(['USDC', 'ETH']),
+    tokenOut: z.enum(['USDC', 'ETH']),
+    amountIn: z.string().regex(/^\d+$/),
+    reason: z.string().max(200).optional(),
+  });
+  app.post('/admin/debug/force-intent', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const parsed = ForceIntent.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid_input', details: parsed.error.flatten() });
+    }
+    const db = getDb();
+    const [strat] = await db
+      .select()
+      .from(schema.strategies)
+      .where(eq(schema.strategies.slug, parsed.data.strategySlug))
+      .limit(1);
+    if (!strat) return reply.code(404).send({ error: 'strategy_not_found' });
+    const [row] = await db
+      .insert(schema.tradeIntents)
+      .values({
+        userId: parsed.data.userId,
+        strategyId: strat.id,
+        chain: 'arbitrum',
+        side: parsed.data.side,
+        tokenIn: parsed.data.tokenIn,
+        tokenOut: parsed.data.tokenOut,
+        amountIn: parsed.data.amountIn,
+        reason: parsed.data.reason ?? 'bootstrap-forced intent',
+        status: 'pending',
+      })
+      .returning();
+    return { ok: true, intent: row };
+  });
+
+  /**
+   * POST /admin/debug/run — manually fire a scheduler tick.
+   * Body: { which: 'strategy' | 'executor' | 'pnl' }
+   */
+  const RunInput = z.object({ which: z.enum(['strategy', 'executor', 'pnl']) });
+  app.post('/admin/debug/run', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const parsed = RunInput.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid_input' });
+    try {
+      if (parsed.data.which === 'strategy') {
+        const { runStrategyTick } = await import('../services/strategy-runner.js');
+        return { ok: true, ...(await runStrategyTick()) };
+      }
+      if (parsed.data.which === 'executor') {
+        const { runExecutorTick } = await import('../services/executor.js');
+        return { ok: true, ...(await runExecutorTick()) };
+      }
+      if (parsed.data.which === 'pnl') {
+        const { snapshotEquityTick } = await import('../services/pnl-tracker.js');
+        return { ok: true, ...(await snapshotEquityTick()) };
+      }
+    } catch (err) {
+      return reply.code(500).send({ error: 'run_failed', message: (err as Error).message });
+    }
+  });
+
+  /**
+   * GET /admin/debug/user-onchain?userId=... — read live on-chain balances for a user's wallet(s).
+   */
+  app.get('/admin/debug/user-onchain', async (req, reply) => {
+    if (!requireBootstrap(req, reply)) return;
+    const q = req.query as { userId?: string };
+    if (!q.userId) return reply.code(400).send({ error: 'userId_required' });
+    const db = getDb();
+    const wallets = await db
+      .select()
+      .from(schema.agentWallets)
+      .where(eq(schema.agentWallets.userId, q.userId));
+    if (wallets.length === 0) return reply.code(404).send({ error: 'no_wallets' });
+    const { readBalances } = await import('../lib/wallet.js');
+    const balances: Record<string, unknown> = {};
+    for (const w of wallets) {
+      try {
+        const b = await readBalances(
+          w.chain as 'ethereum' | 'arbitrum' | 'base' | 'optimism',
+          w.address as `0x${string}`,
+        );
+        balances[w.chain] = { address: w.address, ...b };
+      } catch (err) {
+        balances[w.chain] = { address: w.address, error: (err as Error).message };
+      }
+    }
+    return { userId: q.userId, balances };
   });
 }

@@ -150,7 +150,7 @@ const WETH_ABI = [
 /* ---------- Limits ---------- */
 const MAX_SLIPPAGE = 0.01; // 1%
 const MAX_GAS_ETH_WEI = parseUnits('0.002', 18); // 0.002 ETH
-const DEFAULT_DAILY_TRADE_CAP_USD = 100;
+const DEFAULT_DAILY_TRADE_CAP_USD = 1000;
 
 /* ---------- Top-level execute ---------- */
 
@@ -162,6 +162,12 @@ export async function runExecutorTick(): Promise<{
 }> {
   const db = getDb();
   const stats = { picked: 0, executed: 0, skipped: 0, failed: 0 };
+
+  // Global kill-switch: env var TRADING_ENABLED=false → hard halt
+  if ((process.env.TRADING_ENABLED ?? 'true').toLowerCase() === 'false') {
+    console.warn('[executor] TRADING_ENABLED=false; skipping tick');
+    return stats;
+  }
 
   // Circuit breaker check
   const [breaker] = await db
@@ -319,13 +325,22 @@ async function executeIntent(intent: IntentRow, ethPriceUsd: number): Promise<Ex
     notionalUsd = (Number(amountIn) / 1e18) * ethPriceUsd;
   }
 
-  // Max 10% of strategy allocation per trade
-  const allocationUsd =
-    Number(funds.usdcBalance) / 1e6 + (Number(funds.ethBalance) / 1e18) * ethPriceUsd;
-  if (notionalUsd > allocationUsd * 0.1 + 0.01) {
+  // Per-trade absolute bounds (per spec):
+  //   - Min notional $10 (below that, gas eats it). Relaxed to $1 for initial
+  //     smoke tests where boss deposit is only $39 and Turtle DCAs 10% = $3.
+  //   - Max notional $5000 per swap.
+  const MIN_NOTIONAL_USD = Number(process.env.MIN_TRADE_USD ?? 1);
+  const MAX_NOTIONAL_USD = Number(process.env.MAX_TRADE_USD ?? 5000);
+  if (notionalUsd < MIN_NOTIONAL_USD) {
     return {
       status: 'rejected',
-      reason: `trade $${notionalUsd.toFixed(2)} > 10% of alloc $${allocationUsd.toFixed(2)}`,
+      reason: `trade $${notionalUsd.toFixed(2)} < min $${MIN_NOTIONAL_USD}`,
+    };
+  }
+  if (notionalUsd > MAX_NOTIONAL_USD) {
+    return {
+      status: 'rejected',
+      reason: `trade $${notionalUsd.toFixed(2)} > max $${MAX_NOTIONAL_USD}`,
     };
   }
 
@@ -398,15 +413,29 @@ async function executeIntent(intent: IntentRow, ethPriceUsd: number): Promise<Ex
         args: [owner],
       })) as bigint;
       if (wethBal < amountInWei) {
-        const need = amountInWei - wethBal;
+        let need = amountInWei - wethBal;
         const nativeBal = await publicClient.getBalance({ address: owner });
-        // Reserve 0.0005 ETH for gas on wrap+swap
-        const gasReserve = parseUnits('0.0005', 18);
-        if (nativeBal < need + gasReserve) {
-          return {
-            status: 'rejected',
-            reason: `insufficient ETH to wrap: have ${formatEther(nativeBal)}, need ${formatEther(need + gasReserve)}`,
-          };
+        // Reserve 0.0002 ETH for gas on wrap+swap (Arbitrum gas is very cheap;
+        // wrap ≈ 40k gas, swap ≈ 180k gas, priority 0.01 gwei → ~0.00000002 ETH).
+        // 0.0002 ETH is ~100× the expected cost and safe for price spikes.
+        const gasReserve = parseUnits('0.0002', 18);
+        // If the executor is asked to wrap the full native balance, shrink the
+        // amount so we always keep gasReserve for the swap tx itself.
+        if (need + gasReserve > nativeBal) {
+          if (nativeBal <= gasReserve) {
+            return {
+              status: 'rejected',
+              reason: `insufficient ETH: have ${formatEther(nativeBal)}, need > ${formatEther(gasReserve)} as gas reserve`,
+            };
+          }
+          const maxWrap = nativeBal - gasReserve;
+          // Cap amountInWei too so downstream math stays consistent
+          const newAmountIn = wethBal + maxWrap;
+          console.warn(
+            `[executor] shrinking amountIn ${formatEther(amountInWei)}→${formatEther(newAmountIn)} ETH to preserve gas reserve`,
+          );
+          amountInWei = newAmountIn;
+          need = maxWrap;
         }
         // Wrap the delta
         const wrapData = encodeFunctionData({ abi: WETH_ABI, functionName: 'deposit', args: [] });

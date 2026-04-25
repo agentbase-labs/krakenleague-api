@@ -91,6 +91,9 @@ export async function runStrategyTick(): Promise<{ intentsCreated: number }> {
       }))
       .filter((r) => r.usdcBalance > 0n || r.ethBalance > 0n);
 
+    console.log(
+      `[strategy-runner] ${strat.slug}: ${funds.length} funded users, ethPrice=${market.ethPriceUsd}`,
+    );
     if (funds.length === 0) continue;
 
     const ctx: StrategyContext = {
@@ -101,6 +104,7 @@ export async function runStrategyTick(): Promise<{ intentsCreated: number }> {
     };
 
     const intents = evalFn(ctx);
+    console.log(`[strategy-runner] ${strat.slug}: evaluator returned ${intents.length} intents`);
 
     // Dedupe: skip inserting if a pending intent already exists for (user,strategy)
     for (const intent of intents) {

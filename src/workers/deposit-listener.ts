@@ -29,12 +29,13 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { getDb, schema } from '../lib/db.js';
 import { rpcUrl, USDC_ADDRESS, USDC_DECIMALS } from '../lib/chains.js';
 import { publish } from '../lib/bus.js';
+import { getEthPriceUsd } from '../services/market-data.js';
 
 const POLL_INTERVAL_MS = Number(process.env.DEPOSIT_POLL_MS ?? 30_000);
 const BLOCK_LOOKBACK_CAP = 9000n; // Alchemy free tier caps eth_getLogs at 10k blocks; we stay safe.
 
-// Minimal price feeds for ledger USD tracking. TODO: wire CoinGecko or Chainlink.
-const ETH_PRICE_USD = 3000;
+// Fallback ETH price if CoinGecko call fails (first-boot only — cache persists after).
+const ETH_PRICE_USD_FALLBACK = 3000;
 const USDC_PRICE_USD = 1;
 
 async function fetchLatestBlock(): Promise<bigint> {
@@ -66,7 +67,10 @@ export async function pollOnce(): Promise<void> {
           .where(and(eq(schema.deposits.chain, 'arbitrum'), eq(schema.deposits.txHash, syntheticHash)))
           .limit(1);
         if (existing.length === 0) {
-          const amountUsd = (Number(formatEther(diff)) * ETH_PRICE_USD).toFixed(6);
+          // Live ETH price (CoinGecko, 60s cache). Falls back to 3000 on first-boot fetch failure.
+          const livePrice = await getEthPriceUsd();
+          const ethPrice = livePrice ?? ETH_PRICE_USD_FALLBACK;
+          const amountUsd = (Number(formatEther(diff)) * ethPrice).toFixed(6);
           const [dep] = await db
             .insert(schema.deposits)
             .values({

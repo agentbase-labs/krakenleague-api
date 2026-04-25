@@ -314,4 +314,98 @@ export async function registerAdminRoutes(app: FastifyInstance) {
       return reply.code(500).send({ error: 'poll_failed', message: (err as Error).message });
     }
   });
+
+  /**
+   * Revalue an existing ETH deposit at the current live ETH/USD price.
+   * Updates `deposits.amount_usd` and rewrites the associated `ledger` row so that
+   * the running balance reflects the new USD value. Append-only invariants are
+   * preserved (we update, not delete, only two rows tied to this depositId).
+   *
+   * Body: { depositId: uuid }
+   * Gated by X-Admin-Bootstrap-Token header.
+   */
+  app.post('/admin/debug/revalue-eth-deposit', async (req, reply) => {
+    const token = (req.headers['x-admin-bootstrap-token'] as string | undefined) ?? '';
+    const expected = process.env.ADMIN_BOOTSTRAP_TOKEN;
+    if (!expected || token !== expected) return reply.code(403).send({ error: 'forbidden' });
+    const body = (req.body ?? {}) as { depositId?: string };
+    if (!body.depositId) return reply.code(400).send({ error: 'depositId_required' });
+
+    const db = getDb();
+    const [dep] = await db
+      .select()
+      .from(schema.deposits)
+      .where(eq(schema.deposits.id, body.depositId))
+      .limit(1);
+    if (!dep) return reply.code(404).send({ error: 'deposit_not_found' });
+    if (dep.token !== 'ETH') {
+      return reply.code(400).send({ error: 'not_an_eth_deposit', token: dep.token });
+    }
+
+    const { getEthPriceUsd } = await import('../services/market-data.js');
+    const price = await getEthPriceUsd();
+    if (!price || price <= 0) return reply.code(503).send({ error: 'price_unavailable' });
+
+    // formatEther from viem
+    const { formatEther } = await import('viem');
+    const oldUsd = Number(dep.amountUsd ?? '0');
+    const newUsd = Number(formatEther(BigInt(dep.amount))) * price;
+    const delta = newUsd - oldUsd;
+
+    // 1) Update the deposit row
+    await db
+      .update(schema.deposits)
+      .set({ amountUsd: newUsd.toFixed(6) })
+      .where(eq(schema.deposits.id, dep.id));
+
+    // 2) Find the ledger row tied to this deposit (refId + refType='deposit')
+    const [lrow] = await db
+      .select()
+      .from(schema.ledger)
+      .where(and(eq(schema.ledger.refType, 'deposit'), eq(schema.ledger.refId, dep.id)))
+      .limit(1);
+    if (!lrow) return reply.code(404).send({ error: 'ledger_row_not_found_for_deposit' });
+
+    // 3) Recompute balance_after_usd for this row and all subsequent ledger rows
+    //    for this user. Append-only friendly: we keep rows, we just adjust the
+    //    balance_after_usd column by `delta`.
+    const oldBal = Number(lrow.balanceAfterUsd);
+    const newBal = oldBal + delta;
+    await db
+      .update(schema.ledger)
+      .set({
+        amountUsd: newUsd.toFixed(6),
+        balanceAfterUsd: newBal.toFixed(6),
+        notes: `${lrow.notes ?? ''} | revalued @${price.toFixed(2)}/ETH`,
+      })
+      .where(eq(schema.ledger.id, lrow.id));
+
+    // Bump any later ledger rows for the same user by the same delta.
+    const later = await db
+      .select()
+      .from(schema.ledger)
+      .where(and(eq(schema.ledger.userId, dep.userId), gte(schema.ledger.createdAt, lrow.createdAt)))
+      .orderBy(schema.ledger.createdAt);
+    // later includes lrow itself; skip it.
+    for (const r of later) {
+      if (r.id === lrow.id) continue;
+      const bumped = (Number(r.balanceAfterUsd) + delta).toFixed(6);
+      await db
+        .update(schema.ledger)
+        .set({ balanceAfterUsd: bumped })
+        .where(eq(schema.ledger.id, r.id));
+    }
+
+    return {
+      ok: true,
+      depositId: dep.id,
+      userId: dep.userId,
+      amountWei: dep.amount,
+      ethPriceUsd: price,
+      oldAmountUsd: oldUsd,
+      newAmountUsd: newUsd,
+      delta,
+      laterRowsBumped: Math.max(0, later.length - 1),
+    };
+  });
 }

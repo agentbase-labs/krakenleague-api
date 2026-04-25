@@ -206,4 +206,112 @@ export async function registerAdminRoutes(app: FastifyInstance) {
     if (!u) return reply.code(404).send({ error: 'user_not_found' });
     return { ok: true, userId: u.id, email: u.email, isAdmin: u.isAdmin };
   });
+
+  /**
+   * Bootstrap-gated read of all users and their wallets. Used by ops to diagnose
+   * deposit mismatches. Gated by X-Admin-Bootstrap-Token header.
+   */
+  app.get('/admin/debug/users-and-wallets', async (req, reply) => {
+    const token = (req.headers['x-admin-bootstrap-token'] as string | undefined) ?? '';
+    const expected = process.env.ADMIN_BOOTSTRAP_TOKEN;
+    if (!expected || token !== expected) return reply.code(403).send({ error: 'forbidden' });
+    const db = getDb();
+    const users = await db.select().from(schema.users);
+    const wallets = await db.select().from(schema.agentWallets);
+    const deposits = await db.select().from(schema.deposits);
+    return {
+      users: users.map((u) => ({
+        id: u.id,
+        email: u.email,
+        userIndex: u.userIndex,
+        verifiedEoa: u.verifiedEoa,
+        overCapFlag: u.overCapFlag,
+        isAdmin: u.isAdmin,
+        createdAt: u.createdAt,
+      })),
+      wallets: wallets.map((w) => ({
+        id: w.id,
+        userId: w.userId,
+        chain: w.chain,
+        address: w.address,
+        derivationPath: w.derivationPath,
+        lastScannedBlock: w.lastScannedBlock,
+        lastNativeBalance: w.lastNativeBalance,
+      })),
+      deposits: deposits.map((d) => ({
+        id: d.id,
+        userId: d.userId,
+        chain: d.chain,
+        token: d.token,
+        amount: d.amount,
+        amountUsd: d.amountUsd,
+        txHash: d.txHash,
+        status: d.status,
+        createdAt: d.createdAt,
+      })),
+    };
+  });
+
+  /**
+   * Force a rescan on arbitrum wallets. Optional body: { fromBlock: string }
+   * If fromBlock is provided, reset lastScannedBlock to that value (minus 1 so
+   * next poll starts from it). Also resets lastNativeBalance to 0 so that the
+   * balance-diff detector recounts any existing balance as a new deposit
+   * (idempotent via the synthetic tx hash).
+   *
+   * Gated by X-Admin-Bootstrap-Token header.
+   */
+  app.post('/admin/debug/rescan-arbitrum', async (req, reply) => {
+    const token = (req.headers['x-admin-bootstrap-token'] as string | undefined) ?? '';
+    const expected = process.env.ADMIN_BOOTSTRAP_TOKEN;
+    if (!expected || token !== expected) return reply.code(403).send({ error: 'forbidden' });
+    const body = (req.body ?? {}) as { fromBlock?: string; resetNativeBalance?: boolean };
+    const db = getDb();
+    const update: Record<string, string> = {};
+    if (body.fromBlock) {
+      const fb = BigInt(body.fromBlock);
+      update.lastScannedBlock = (fb - 1n).toString();
+    }
+    if (body.resetNativeBalance) {
+      update.lastNativeBalance = '0';
+    }
+    if (Object.keys(update).length === 0) {
+      return reply.code(400).send({ error: 'nothing_to_update' });
+    }
+    const rows = await db
+      .update(schema.agentWallets)
+      .set(update)
+      .where(eq(schema.agentWallets.chain, 'arbitrum'))
+      .returning();
+    return {
+      ok: true,
+      updated: rows.length,
+      wallets: rows.map((w) => ({
+        id: w.id,
+        address: w.address,
+        lastScannedBlock: w.lastScannedBlock,
+        lastNativeBalance: w.lastNativeBalance,
+      })),
+    };
+  });
+
+  /**
+   * Poll the deposit listener once right now (instead of waiting 30s).
+   * Gated by X-Admin-Bootstrap-Token header.
+   */
+  app.post('/admin/debug/poll-now', async (req, reply) => {
+    const token = (req.headers['x-admin-bootstrap-token'] as string | undefined) ?? '';
+    const expected = process.env.ADMIN_BOOTSTRAP_TOKEN;
+    if (!expected || token !== expected) return reply.code(403).send({ error: 'forbidden' });
+    try {
+      const mod = await import('../workers/deposit-listener.js');
+      if (typeof (mod as { pollOnce?: () => Promise<void> }).pollOnce === 'function') {
+        await (mod as { pollOnce: () => Promise<void> }).pollOnce();
+        return { ok: true, triggered: 'pollOnce' };
+      }
+      return reply.code(500).send({ error: 'pollOnce_not_exported' });
+    } catch (err) {
+      return reply.code(500).send({ error: 'poll_failed', message: (err as Error).message });
+    }
+  });
 }

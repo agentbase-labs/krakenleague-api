@@ -31,7 +31,7 @@ import { rpcUrl, USDC_ADDRESS, USDC_DECIMALS } from '../lib/chains.js';
 import { publish } from '../lib/bus.js';
 
 const POLL_INTERVAL_MS = Number(process.env.DEPOSIT_POLL_MS ?? 30_000);
-const BLOCK_LOOKBACK_CAP = 2000n; // Alchemy free tier caps eth_getLogs at 10k blocks; we stay safe.
+const BLOCK_LOOKBACK_CAP = 9000n; // Alchemy free tier caps eth_getLogs at 10k blocks; we stay safe.
 
 // Minimal price feeds for ledger USD tracking. TODO: wire CoinGecko or Chainlink.
 const ETH_PRICE_USD = 3000;
@@ -42,7 +42,7 @@ async function fetchLatestBlock(): Promise<bigint> {
   return await client.getBlockNumber();
 }
 
-async function pollOnce(): Promise<void> {
+export async function pollOnce(): Promise<void> {
   const db = getDb();
   const wallets = await db.select().from(schema.agentWallets).where(eq(schema.agentWallets.chain, 'arbitrum'));
   if (wallets.length === 0) return;

@@ -46,6 +46,18 @@ export function deriveAddress(userIndex: number): `0x${string}` {
   return account.address;
 }
 
+/**
+ * Internal: return the raw private key for a derived account.
+ * ⚠️ Must only be called from executor/withdrawal signing code. Never log.
+ */
+export function getInternalPrivateKey(userIndex: number): `0x${string}` {
+  return derivePrivateKey(userIndex);
+}
+
+export function derivationPathForInternal(userIndex: number): string {
+  return derivationPathFor(userIndex);
+}
+
 /** Returns the raw private key for a derived account. ⚠️ use only inside signing. */
 function derivePrivateKey(userIndex: number): `0x${string}` {
   const path = derivationPathFor(userIndex);

@@ -29,6 +29,27 @@ export const strategyStatusEnum = pgEnum('strategy_status', [
   'live',
   'paused',
   'retired',
+  'active',
+  'coming_soon',
+]);
+
+export const tradeIntentStatusEnum = pgEnum('trade_intent_status', [
+  'pending',
+  'executing',
+  'executed',
+  'rejected',
+  'expired',
+  'failed',
+]);
+
+export const tradeSideEnum = pgEnum('trade_side', ['buy', 'sell']);
+
+export const tradeStatusEnum = pgEnum('trade_status', [
+  'pending',
+  'simulated',
+  'broadcast',
+  'confirmed',
+  'failed',
 ]);
 
 export const depositStatusEnum = pgEnum('deposit_status', [
@@ -70,6 +91,8 @@ export const users = pgTable(
     verifiedEoa: varchar('verified_eoa', { length: 42 }),
     /** Admin flag set when deposits push balance over the soft cap. */
     overCapFlag: boolean('over_cap_flag').notNull().default(false),
+    /** Admin user (can hit /admin/* endpoints). */
+    isAdmin: boolean('is_admin').notNull().default(false),
     createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
   },
   (t) => ({
@@ -239,3 +262,145 @@ export const systemFlags = pgTable('system_flags', {
   stringValue: text('string_value'),
   updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
 });
+
+/* ---------------- Strategy allocations (off-chain $ balance per strategy) ---------------- */
+
+/**
+ * Tracks the **USD value** a user has allocated to a given strategy. Source
+ * of truth for "what funds can this strategy use". Starts at 0; `POST /allocations/fund`
+ * moves USD from the user's unallocated wallet balance into a strategy bucket.
+ *
+ * NOTE: this is OFF-CHAIN accounting. There is ONE on-chain wallet per user;
+ * the strategy just gets a virtual sub-balance.
+ */
+export const strategyFunds = pgTable(
+  'strategy_funds',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    strategyId: uuid('strategy_id')
+      .notNull()
+      .references(() => strategies.id, { onDelete: 'cascade' }),
+    /** USDC balance allocated to this strategy (base units, 6 decimals). */
+    usdcBalance: numeric('usdc_balance', { precision: 78, scale: 0 }).notNull().default('0'),
+    /** ETH balance held by this strategy (wei, 18 decimals). */
+    ethBalance: numeric('eth_balance', { precision: 78, scale: 0 }).notNull().default('0'),
+    /** Avg entry price in USD for the ETH held (for P&L). Numeric for precision. */
+    ethAvgEntryUsd: numeric('eth_avg_entry_usd', { precision: 20, scale: 6 }).notNull().default('0'),
+    /** Realized USD P&L across all closed trades for this strategy. */
+    realizedPnlUsd: numeric('realized_pnl_usd', { precision: 20, scale: 6 }).notNull().default('0'),
+    /** Last trade timestamp, used by Turtle for weekly DCA gating. */
+    lastTradeAt: timestamp('last_trade_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    userStrategyIdx: uniqueIndex('strategy_funds_user_strategy_idx').on(t.userId, t.strategyId),
+  }),
+);
+
+/* ---------------- Trade intents ---------------- */
+
+/**
+ * Decisions produced by the strategy runner, picked up by the executor.
+ * One row per (userId, strategyId, decision).
+ */
+export const tradeIntents = pgTable(
+  'trade_intents',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    strategyId: uuid('strategy_id')
+      .notNull()
+      .references(() => strategies.id, { onDelete: 'cascade' }),
+    chain: chainEnum('chain').notNull().default('arbitrum'),
+    side: tradeSideEnum('side').notNull(),
+    /** 'ETH' or 'USDC' — the token being BOUGHT. */
+    tokenIn: varchar('token_in', { length: 16 }).notNull(),
+    tokenOut: varchar('token_out', { length: 16 }).notNull(),
+    /** Amount of tokenIn to spend (base units). */
+    amountIn: numeric('amount_in', { precision: 78, scale: 0 }).notNull(),
+    /** Human-readable rationale for this intent. */
+    reason: text('reason').notNull().default(''),
+    status: tradeIntentStatusEnum('status').notNull().default('pending'),
+    errorMessage: text('error_message'),
+    /** Link to the trade that executed this intent (if any). */
+    tradeId: uuid('trade_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    statusIdx: index('trade_intents_status_idx').on(t.status),
+    userIdx: index('trade_intents_user_idx').on(t.userId),
+    strategyIdx: index('trade_intents_strategy_idx').on(t.strategyId),
+  }),
+);
+
+/* ---------------- Trades ---------------- */
+
+export const trades = pgTable(
+  'trades',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    intentId: uuid('intent_id'),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    strategyId: uuid('strategy_id')
+      .notNull()
+      .references(() => strategies.id, { onDelete: 'cascade' }),
+    chain: chainEnum('chain').notNull().default('arbitrum'),
+    side: tradeSideEnum('side').notNull(),
+    tokenIn: varchar('token_in', { length: 16 }).notNull(),
+    tokenOut: varchar('token_out', { length: 16 }).notNull(),
+    amountIn: numeric('amount_in', { precision: 78, scale: 0 }).notNull(),
+    amountOut: numeric('amount_out', { precision: 78, scale: 0 }).notNull(),
+    /** USD notional at execution (positive). */
+    notionalUsd: numeric('notional_usd', { precision: 20, scale: 6 }).notNull(),
+    /** Gas spent (wei). */
+    gasWei: numeric('gas_wei', { precision: 78, scale: 0 }).notNull().default('0'),
+    gasUsd: numeric('gas_usd', { precision: 20, scale: 6 }).notNull().default('0'),
+    /** Realised slippage observed between quote and fill, as a fraction (e.g. 0.003 = 30bps). */
+    slippage: numeric('slippage', { precision: 10, scale: 6 }).notNull().default('0'),
+    txHash: varchar('tx_hash', { length: 128 }),
+    status: tradeStatusEnum('status').notNull().default('pending'),
+    errorMessage: text('error_message'),
+    /** P&L realised on this specific trade (sells only). */
+    realizedPnlUsd: numeric('realized_pnl_usd', { precision: 20, scale: 6 }).notNull().default('0'),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    userCreatedIdx: index('trades_user_created_idx').on(t.userId, t.createdAt),
+    strategyCreatedIdx: index('trades_strategy_created_idx').on(t.strategyId, t.createdAt),
+    txIdx: uniqueIndex('trades_tx_idx').on(t.txHash),
+  }),
+);
+
+/* ---------------- Equity snapshots (time-series) ---------------- */
+
+export const equitySnapshots = pgTable(
+  'equity_snapshots',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    strategyId: uuid('strategy_id')
+      .notNull()
+      .references(() => strategies.id, { onDelete: 'cascade' }),
+    equityUsd: numeric('equity_usd', { precision: 20, scale: 6 }).notNull(),
+    ethPriceUsd: numeric('eth_price_usd', { precision: 20, scale: 6 }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => ({
+    strategyCreatedIdx: index('equity_snapshots_strategy_created_idx').on(t.strategyId, t.createdAt),
+    userStrategyCreatedIdx: index('equity_snapshots_user_strategy_created_idx').on(
+      t.userId,
+      t.strategyId,
+      t.createdAt,
+    ),
+  }),
+);

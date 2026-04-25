@@ -12,7 +12,12 @@ import { registerPortfolioRoutes } from './routes/portfolio.js';
 import { registerLeagueRoutes } from './routes/league.js';
 import { registerTradeRoutes } from './routes/trades.js';
 import { registerWsRoutes } from './routes/ws.js';
+import { registerAdminRoutes } from './routes/admin.js';
 import { startDepositListener } from './workers/deposit-listener.js';
+import { startMarketDataPoller } from './services/market-data.js';
+import { startStrategyRunner } from './services/strategy-runner.js';
+import { startExecutor } from './services/executor.js';
+import { startPnlTracker } from './services/pnl-tracker.js';
 
 const PORT = Number(process.env.PORT ?? 10000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -96,6 +101,7 @@ export async function buildServer() {
   await registerLeagueRoutes(app);
   await registerTradeRoutes(app);
   await registerWsRoutes(app);
+  await registerAdminRoutes(app);
 
   return app;
 }
@@ -107,6 +113,16 @@ async function main() {
     app.log.info(`🐙 Kraken League API listening on http://${HOST}:${PORT}`);
     // Start background workers only after server is up
     startDepositListener();
+    startMarketDataPoller();
+    if (process.env.STRATEGY_RUNNER_ENABLED !== 'false') {
+      startStrategyRunner();
+    }
+    if (process.env.EXECUTOR_ENABLED !== 'false') {
+      startExecutor();
+    }
+    if (process.env.PNL_TRACKER_ENABLED !== 'false') {
+      startPnlTracker();
+    }
   } catch (err) {
     app.log.error(err);
     process.exit(1);

@@ -560,15 +560,32 @@ async function executeIntent(intent: IntentRow, ethPriceUsd: number): Promise<Ex
       ],
     });
 
-    // SIMULATE
-    try {
-      await publicClient.call({
-        account: owner,
-        to: SWAP_ROUTER_02,
-        data: swapCalldata,
-      });
-    } catch (err) {
-      return { status: 'rejected', reason: `swap simulation reverted: ${(err as Error).message}` };
+    // SIMULATE — retry up to 3× because Alchemy sometimes serves stale state
+    // to eth_call right after a preceding wrap/approve tx lands. Each retry
+    // waits briefly so the node catches up.
+    let simOk = false;
+    let simErr: Error | null = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await publicClient.call({
+          account: owner,
+          to: SWAP_ROUTER_02,
+          data: swapCalldata,
+        });
+        simOk = true;
+        break;
+      } catch (err) {
+        simErr = err as Error;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 800));
+        }
+      }
+    }
+    if (!simOk) {
+      return {
+        status: 'rejected',
+        reason: `swap simulation reverted after 3 tries: ${simErr?.message ?? 'unknown'}`,
+      };
     }
 
     // BROADCAST

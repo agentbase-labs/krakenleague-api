@@ -1,0 +1,36 @@
+{
+  "name": "krakenleague-api",
+  "version": "0.1.0",
+  "private": true,
+  "description": "🐙 Kraken League — live backend API (auth, wallets, deposits, withdrawals)",
+  "main": "dist/server.js",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "migrate": "node dist/lib/migrate.js",
+    "seed": "node dist/lib/seed.js",
+    "predeploy": "node dist/lib/migrate.js && node dist/lib/seed.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "@fastify/cors": "^10.0.1",
+    "@fastify/jwt": "^9.0.1",
+    "@fastify/rate-limit": "^10.1.1",
+    "@fastify/websocket": "^11.0.1",
+    "bcryptjs": "^2.4.3",
+    "drizzle-orm": "^0.36.4",
+    "fastify": "^5.1.0",
+    "postgres": "^3.4.5",
+    "viem": "^2.48.4",
+    "zod": "^3.23.8",
+    "typescript": "^5.6.3",
+    "tsx": "^4.19.2",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.10.0",
+    "drizzle-kit": "^0.28.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
